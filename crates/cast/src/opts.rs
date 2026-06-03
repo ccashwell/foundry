@@ -1,13 +1,33 @@
 #[cfg(feature = "optimism")]
 use crate::cmd::da_estimate::DAEstimateArgs;
 use crate::cmd::{
-    access_list::AccessListArgs, artifact::ArtifactArgs, b2e_payload::B2EPayloadArgs,
-    batch_mktx::BatchMakeTxArgs, batch_send::BatchSendArgs, bind::BindArgs, call::CallArgs,
-    constructor_args::ConstructorArgsArgs, create2::Create2Args, creation_code::CreationCodeArgs,
-    erc20::Erc20Subcommand, estimate::EstimateArgs, find_block::FindBlockArgs,
-    interface::InterfaceArgs, keychain::KeychainSubcommand, logs::LogsArgs, mktx::MakeTxArgs,
-    rpc::RpcArgs, run::RunArgs, send::SendTxArgs, storage::StorageArgs, tip20::Tip20Subcommand,
-    trace::TraceArgs, txpool::TxPoolSubcommands, vaddr::VaddrSubcommand, wallet::WalletSubcommands,
+    access_list::AccessListArgs,
+    artifact::ArtifactArgs,
+    b2e_payload::B2EPayloadArgs,
+    batch_mktx::BatchMakeTxArgs,
+    batch_send::BatchSendArgs,
+    bind::BindArgs,
+    call::CallArgs,
+    constructor_args::ConstructorArgsArgs,
+    create2::Create2Args,
+    creation_code::CreationCodeArgs,
+    erc20::Erc20Subcommand,
+    estimate::EstimateArgs,
+    find_block::FindBlockArgs,
+    interface::InterfaceArgs,
+    keychain::{KeyAuthSubcommand, KeychainSubcommand},
+    logs::LogsArgs,
+    mktx::MakeTxArgs,
+    rpc::RpcArgs,
+    run::RunArgs,
+    send::SendTxArgs,
+    storage::StorageArgs,
+    tempo::TempoSubcommand,
+    tip20::Tip20Subcommand,
+    trace::TraceArgs,
+    txpool::TxPoolSubcommands,
+    vaddr::VaddrSubcommand,
+    wallet::WalletSubcommands,
 };
 use alloy_ens::NameOrAddress;
 use alloy_primitives::{Address, B256, Selector, U256};
@@ -1085,6 +1105,7 @@ pub enum CastSubcommand {
         sig: Option<String>,
 
         /// Optimize signature to contain provided amount of leading zeroes in selector.
+        #[arg(conflicts_with = "json")]
         optimize: Option<usize>,
     },
 
@@ -1187,6 +1208,19 @@ pub enum CastSubcommand {
     Keychain {
         #[command(subcommand)]
         command: KeychainSubcommand,
+    },
+
+    /// Tempo key authorization RLP helpers.
+    #[command(name = "key-auth")]
+    KeyAuth {
+        #[command(subcommand)]
+        command: KeyAuthSubcommand,
+    },
+
+    /// Tempo wallet integration (login, etc.).
+    Tempo {
+        #[command(subcommand)]
+        command: TempoSubcommand,
     },
 
     /// TIP-1022 virtual address registry operations (Tempo).

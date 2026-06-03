@@ -7,7 +7,7 @@ use alloy_dyn_abi::{DecodedEvent, DynSolValue, EventExt, FunctionExt, JsonAbiExt
 use alloy_json_abi::{Error, Event, Function, JsonAbi};
 use alloy_primitives::{
     Address, B256, LogData, Selector,
-    map::{HashMap, HashSet, hash_map::Entry},
+    map::{HashMap, HashSet},
 };
 use foundry_common::{
     ContractsByArtifact, SELECTOR_LEN, abi::get_indexed_event, fmt::format_token,
@@ -27,12 +27,14 @@ use itertools::Itertools;
 use revm_inspectors::tracing::types::{DecodedCallLog, DecodedCallTrace};
 use std::{collections::BTreeMap, sync::OnceLock};
 use tempo_contracts::precompiles::{
-    IAccountKeychain, IFeeManager, IStablecoinDEX, ITIP20Factory, ITIP403Registry, IValidatorConfig,
+    IAccountKeychain, IAddressRegistry, IFeeManager, IReceivePolicyGuard, ISignatureVerifier,
+    IStablecoinDEX, ITIP20ChannelReserve, ITIP20Factory, ITIP403Registry, IValidatorConfig,
 };
 use tempo_precompiles::{
-    ACCOUNT_KEYCHAIN_ADDRESS, NONCE_PRECOMPILE_ADDRESS, PATH_USD_ADDRESS, STABLECOIN_DEX_ADDRESS,
-    TIP_FEE_MANAGER_ADDRESS, TIP20_FACTORY_ADDRESS, TIP403_REGISTRY_ADDRESS,
-    VALIDATOR_CONFIG_ADDRESS, nonce::INonce, tip20::ITIP20,
+    ACCOUNT_KEYCHAIN_ADDRESS, ADDRESS_REGISTRY_ADDRESS, NONCE_PRECOMPILE_ADDRESS, PATH_USD_ADDRESS,
+    RECEIVE_POLICY_GUARD_ADDRESS, SIGNATURE_VERIFIER_ADDRESS, STABLECOIN_DEX_ADDRESS,
+    TIP_FEE_MANAGER_ADDRESS, TIP20_CHANNEL_RESERVE_ADDRESS, TIP20_FACTORY_ADDRESS,
+    TIP403_REGISTRY_ADDRESS, VALIDATOR_CONFIG_ADDRESS, nonce::INonce, tip20::ITIP20,
 };
 
 mod precompiles;
@@ -149,6 +151,8 @@ pub struct CallTraceDecoder {
 
     /// All known functions.
     pub functions: HashMap<Selector, Vec<Function>>,
+    /// Functions identified for a specific contract address.
+    pub functions_by_address: HashMap<Address, HashMap<Selector, Vec<Function>>>,
     /// All known events.
     ///
     /// Key is: `(topics[0], topics.len() - 1)`.
@@ -185,6 +189,21 @@ impl CallTraceDecoder {
 
     #[instrument(name = "CallTraceDecoder::init", level = "debug")]
     fn init() -> Self {
+        // Materialized once so the revert decoder can take references below.
+        let tempo_abis = [
+            IFeeManager::abi::contract(),
+            ITIP20::abi::contract(),
+            ITIP403Registry::abi::contract(),
+            ITIP20Factory::abi::contract(),
+            IStablecoinDEX::abi::contract(),
+            INonce::abi::contract(),
+            IValidatorConfig::abi::contract(),
+            IAccountKeychain::abi::contract(),
+            IAddressRegistry::abi::contract(),
+            ITIP20ChannelReserve::abi::contract(),
+            ISignatureVerifier::abi::contract(),
+            IReceivePolicyGuard::abi::contract(),
+        ];
         Self {
             contracts: Default::default(),
             labels: HashMap::from_iter([
@@ -218,6 +237,10 @@ impl CallTraceDecoder {
                 (NONCE_PRECOMPILE_ADDRESS, "Nonce".to_string()),
                 (VALIDATOR_CONFIG_ADDRESS, "ValidatorConfig".to_string()),
                 (ACCOUNT_KEYCHAIN_ADDRESS, "AccountKeychain".to_string()),
+                (ADDRESS_REGISTRY_ADDRESS, "AddressRegistry".to_string()),
+                (TIP20_CHANNEL_RESERVE_ADDRESS, "TIP20ChannelReserve".to_string()),
+                (SIGNATURE_VERIFIER_ADDRESS, "SignatureVerifier".to_string()),
+                (RECEIVE_POLICY_GUARD_ADDRESS, "ReceivePolicyGuard".to_string()),
                 (PATH_USD_ADDRESS, "PathUSD".to_string()),
             ]),
             receive_contracts: Default::default(),
@@ -236,9 +259,14 @@ impl CallTraceDecoder {
                 .chain(INonce::abi::functions().into_values())
                 .chain(IValidatorConfig::abi::functions().into_values())
                 .chain(IAccountKeychain::abi::functions().into_values())
+                .chain(IAddressRegistry::abi::functions().into_values())
+                .chain(ITIP20ChannelReserve::abi::functions().into_values())
+                .chain(ISignatureVerifier::abi::functions().into_values())
+                .chain(IReceivePolicyGuard::abi::functions().into_values())
                 .flatten()
                 .map(|func| (func.selector(), vec![func]))
                 .collect(),
+            functions_by_address: Default::default(),
             events: console::ds::abi::events()
                 .into_values()
                 // Tempo
@@ -250,10 +278,15 @@ impl CallTraceDecoder {
                 .chain(INonce::abi::events().into_values())
                 .chain(IValidatorConfig::abi::events().into_values())
                 .chain(IAccountKeychain::abi::events().into_values())
+                .chain(IAddressRegistry::abi::events().into_values())
+                .chain(ITIP20ChannelReserve::abi::events().into_values())
+                .chain(ISignatureVerifier::abi::events().into_values())
+                .chain(IReceivePolicyGuard::abi::events().into_values())
                 .flatten()
                 .map(|event| ((event.selector(), indexed_inputs(&event)), vec![event]))
                 .collect(),
-            revert_decoder: Default::default(),
+            // Decode Tempo precompile custom errors by name in traces.
+            revert_decoder: RevertDecoder::new().with_abis(tempo_abis.iter()),
 
             signature_identifier: None,
             verbosity: 0,
@@ -278,6 +311,7 @@ impl CallTraceDecoder {
         self.receive_contracts.clear();
         self.fallback_contracts.clear();
         self.non_fallback_contracts.clear();
+        self.functions_by_address.clear();
     }
 
     /// Identify unknown addresses in the specified call trace using the specified identifier.
@@ -315,24 +349,49 @@ impl CallTraceDecoder {
 
     /// Adds a single function to the decoder.
     pub fn push_function(&mut self, function: Function) {
-        match self.functions.entry(function.selector()) {
-            Entry::Occupied(entry) => {
-                // This shouldn't happen that often.
-                if entry.get().contains(&function) {
-                    return;
-                }
-                trace!(target: "evm::traces", selector=%entry.key(), new=%function.signature(), "duplicate function selector");
-                entry.into_mut().push(function);
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(vec![function]);
-            }
+        let selector = function.selector();
+        let functions = self.functions.entry(selector).or_default();
+
+        if Self::push_function_to(functions, function) && functions.len() > 1 {
+            let function = functions.last().expect("function was just inserted");
+            let signature = function.signature();
+            trace!(target: "evm::traces", %selector, new=%signature, "duplicate function selector");
         }
     }
 
-    /// Selects the appropriate function from a list of functions with the same selector
-    /// by checking which one belongs to the contract being called, this avoids collisions
-    /// where multiple different functions across different contracts have the same selector.
+    /// Adds a single function to the decoder for a specific contract address.
+    pub fn push_address_function(&mut self, address: Address, function: Function) {
+        let functions = self
+            .functions_by_address
+            .entry(address)
+            .or_default()
+            .entry(function.selector())
+            .or_default();
+        Self::push_function_to(functions, function);
+    }
+
+    fn push_function_to(functions: &mut Vec<Function>, function: Function) -> bool {
+        if functions.contains(&function) {
+            false
+        } else {
+            functions.push(function);
+            true
+        }
+    }
+
+    fn functions_for_selector(&self, address: Address, selector: &Selector) -> Option<&[Function]> {
+        self.functions_by_address
+            .get(&address)
+            .and_then(|functions| functions.get(selector))
+            .or_else(|| self.functions.get(selector))
+            .map(Vec::as_slice)
+    }
+
+    /// Selects the appropriate function from a list of functions with the same selector by
+    /// checking which one decodes the calldata.
+    ///
+    /// Address-scoped function lookup should happen before this to avoid using ABI metadata from a
+    /// different contract when multiple functions have the same input types.
     fn select_contract_function<'a>(
         &self,
         functions: &'a [Function],
@@ -394,6 +453,9 @@ impl CallTraceDecoder {
         }
         trace!(target: "evm::traces", len, ?address, "collecting ABI");
         for function in abi.functions() {
+            if let Some(address) = address {
+                self.push_address_function(address, function.clone());
+            }
             self.push_function(function.clone());
         }
         for event in abi.events() {
@@ -459,16 +521,16 @@ impl CallTraceDecoder {
 
         if is_abi_call_data(cdata) {
             let selector = Selector::try_from(&cdata[..SELECTOR_LEN]).unwrap();
-            let mut functions = Vec::new();
-            let functions = match self.functions.get(&selector) {
-                Some(fs) => fs,
+            let mut identified_functions = Vec::new();
+            let functions = match self.functions_for_selector(trace.address, &selector) {
+                Some(functions) => functions,
                 None => {
                     if let Some(identifier) = &self.signature_identifier
                         && let Some(function) = identifier.identify_function(selector).await
                     {
-                        functions.push(function);
+                        identified_functions.push(function);
                     }
-                    &functions
+                    &identified_functions
                 }
             };
 
@@ -768,7 +830,7 @@ impl CallTraceDecoder {
         // This is due to trace.status is derived from the revm_interpreter::InstructionResult in
         // revm-inspectors status will `None` post revm 27, as `InstructionResult::Continue` does
         // not exists anymore.
-        if trace.status.is_none() || trace.status.is_some_and(|s| s.is_ok()) {
+        if trace.status.is_none_or(|s| s.is_ok()) {
             return None;
         }
         (!trace.success).then(|| self.revert_decoder.decode(&trace.output, trace.status))

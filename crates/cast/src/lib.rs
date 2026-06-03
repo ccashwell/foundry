@@ -40,6 +40,7 @@ use foundry_common::{
 use foundry_config::Chain;
 use foundry_evm::core::bytecode::InstIter;
 use futures::{FutureExt, StreamExt, future::Either};
+#[cfg(feature = "optimism")]
 use op_alloy_consensus as _;
 
 use rayon::prelude::*;
@@ -59,6 +60,8 @@ pub use foundry_evm::*;
 
 pub mod args;
 pub mod cmd;
+pub mod diagnostic;
+pub mod introspect;
 pub mod opts;
 pub mod tempo;
 
@@ -1131,8 +1134,19 @@ where
             let encoded = tx.as_ref().encoded_2718();
             format!("0x{}", hex::encode(encoded))
         } else if let Some(ref field) = field {
-            get_pretty_tx_attr::<N>(&tx, field.as_str())
-                .ok_or_else(|| eyre::eyre!("invalid tx field: {}", field.clone()))?
+            if let Some(value) = get_pretty_tx_attr::<N>(&tx, field.as_str()) {
+                value
+            } else {
+                let tx_json = serde_json::to_value(&tx)?;
+                let value = tx_json
+                    .get(field)
+                    .ok_or_else(|| eyre::eyre!("invalid tx field: {}", field.clone()))?;
+
+                match value {
+                    serde_json::Value::String(value) => value.clone(),
+                    value => value.to_string(),
+                }
+            }
         } else if shell::is_json() {
             // to_value first to sort json object keys
             serde_json::to_value(&tx)?.to_string()
@@ -2221,7 +2235,7 @@ impl SimpleCast {
         if let Some(path) = output_path {
             fs::create_dir_all(path.parent().unwrap())?;
             fs::write(&path, flattened)?;
-            sh_println!("Flattened file written at {}", path.display())?
+            sh_status!("Flattened file written at {}", path.display())?
         } else {
             sh_println!("{flattened}")?
         }

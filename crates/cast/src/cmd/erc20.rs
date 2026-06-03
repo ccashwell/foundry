@@ -11,10 +11,11 @@ use alloy_ens::NameOrAddress;
 use alloy_network::{Ethereum, EthereumWallet, Network, TransactionBuilder};
 use alloy_primitives::{Address, U256};
 use alloy_provider::{Provider, fillers::RecommendedFillers};
-use alloy_signer::Signature;
+use alloy_signer::{Signature, Signer};
 use alloy_sol_types::sol;
 use clap::Parser;
 use foundry_cli::{
+    json::{print_json_success, print_scalar},
     opts::RpcOpts,
     utils::{LoadConfig, get_chain, get_provider},
 };
@@ -362,6 +363,16 @@ impl Erc20Subcommand {
                 $provider:ident |
                 $build_tx:expr
             ) => {{
+                let mut tx_opts = $tx_opts;
+                let print_sponsor_hash = tx_opts.tempo.print_sponsor_hash;
+                let expires_at = tx_opts.tempo.resolve_expires();
+                let tempo_sponsor =
+                    if print_sponsor_hash { None } else { tx_opts.tempo.sponsor_config().await? };
+                let needs_sponsor_payload = print_sponsor_hash || tempo_sponsor.is_some();
+                if let Some(ts) = expires_at {
+                    sh_status!("Transaction expires at unix timestamp {ts}")?;
+                }
+
                 let timeout = $send_tx.timeout.unwrap_or(config.transaction_timeout);
                 if let Some(ref access_key) = tempo_keychain {
                     let signer = pre_resolved_signer
@@ -371,10 +382,38 @@ impl Erc20Subcommand {
                         ProviderBuilder::<TempoNetwork>::from_config(&config)?.build()?;
                     let $erc20 = IERC20::new($token.resolve(&$provider).await?, &$provider);
                     let mut tx = { $build_tx }.into_transaction_request();
-                    $tx_opts.apply::<TempoNetwork>(
-                        &mut tx,
-                        get_chain(config.chain, &$provider).await?.is_legacy(),
-                    );
+                    let chain = get_chain(config.chain, &$provider).await?;
+                    tx_opts.apply::<TempoNetwork>(&mut tx, chain.is_legacy());
+                    if needs_sponsor_payload {
+                        tx.set_key_id(access_key.key_address);
+                        tx.prepare_access_key_authorization(
+                            &$provider,
+                            access_key.wallet_address,
+                            access_key.key_address,
+                            access_key.key_authorization.as_ref(),
+                        )
+                        .await?;
+                        fill_tx(&$provider, &mut tx, access_key.wallet_address, chain).await?;
+                        if print_sponsor_hash {
+                            let hash = tx
+                                .compute_sponsor_hash(access_key.wallet_address)
+                                .ok_or_else(|| {
+                                    eyre::eyre!(
+                                        "This network does not support sponsored transactions"
+                                    )
+                                })?;
+                            sh_println!("{hash:?}")?;
+                            return Ok(());
+                        }
+                        if let Some(sponsor) = &tempo_sponsor {
+                            sponsor
+                                .attach_and_print::<TempoNetwork>(
+                                    &mut tx,
+                                    access_key.wallet_address,
+                                )
+                                .await?;
+                        }
+                    }
                     cast_send_with_access_key(
                         &$provider,
                         tx,
@@ -384,7 +423,7 @@ impl Erc20Subcommand {
                         $send_tx.confirmations,
                         timeout,
                     )
-                    .await?
+                    .await?;
                 } else if let Some(browser) = $send_tx.browser.run::<N>().await? {
                     let $provider = ProviderBuilder::<N>::from_config(&config)?.build()?;
                     if let Some(interval) = $send_tx.poll_interval {
@@ -393,11 +432,21 @@ impl Erc20Subcommand {
                     let $erc20 = IERC20::new($token.resolve(&$provider).await?, &$provider);
                     let mut tx = { $build_tx }.into_transaction_request();
                     let chain = get_chain(config.chain, &$provider).await?;
-                    $tx_opts.apply::<N>(&mut tx, chain.is_legacy());
+                    tx_opts.apply::<N>(&mut tx, chain.is_legacy());
                     if chain.is_tempo() && tx.fee_token().is_none() {
                         tx.set_fee_token(PATH_USD_ADDRESS);
                     }
                     fill_tx(&$provider, &mut tx, browser.address(), chain).await?;
+                    if print_sponsor_hash {
+                        let hash = tx.compute_sponsor_hash(browser.address()).ok_or_else(|| {
+                            eyre::eyre!("This network does not support sponsored transactions")
+                        })?;
+                        sh_println!("{hash:?}")?;
+                        return Ok(());
+                    }
+                    if let Some(sponsor) = &tempo_sponsor {
+                        sponsor.attach_and_print::<N>(&mut tx, browser.address()).await?;
+                    }
                     let tx_hash = browser.send_transaction_via_browser(tx).await?;
                     CastTxSender::new(&$provider)
                         .print_tx_result(
@@ -409,13 +458,25 @@ impl Erc20Subcommand {
                         .await?
                 } else {
                     let signer = pre_resolved_signer.unwrap_or($send_tx.eth.wallet.signer().await?);
+                    let from = signer.address();
                     let $provider = build_provider_with_signer::<N>(&$send_tx, signer)?;
                     let $erc20 = IERC20::new($token.resolve(&$provider).await?, &$provider);
                     let mut tx = { $build_tx }.into_transaction_request();
-                    $tx_opts.apply::<N>(
-                        &mut tx,
-                        get_chain(config.chain, &$provider).await?.is_legacy(),
-                    );
+                    let chain = get_chain(config.chain, &$provider).await?;
+                    tx_opts.apply::<N>(&mut tx, chain.is_legacy());
+                    if needs_sponsor_payload {
+                        fill_tx(&$provider, &mut tx, from, chain).await?;
+                        if print_sponsor_hash {
+                            let hash = tx.compute_sponsor_hash(from).ok_or_else(|| {
+                                eyre::eyre!("This network does not support sponsored transactions")
+                            })?;
+                            sh_println!("{hash:?}")?;
+                            return Ok(());
+                        }
+                        if let Some(sponsor) = &tempo_sponsor {
+                            sponsor.attach_and_print::<N>(&mut tx, from).await?;
+                        }
+                    }
                     cast_send(
                         $provider,
                         tx,
@@ -424,7 +485,7 @@ impl Erc20Subcommand {
                         $send_tx.confirmations,
                         timeout,
                     )
-                    .await?
+                    .await?;
                 }
             }};
         }
@@ -444,9 +505,9 @@ impl Erc20Subcommand {
                     .await?;
 
                 if shell::is_json() {
-                    sh_println!("{}", serde_json::to_string(&allowance.to_string())?)?
+                    print_json_success(allowance.to_string())?;
                 } else {
-                    sh_println!("{}", format_uint_exp(allowance))?
+                    sh_println!("{}", format_uint_exp(allowance))?;
                 }
             }
             Self::Balance { token, owner, block, .. } => {
@@ -461,9 +522,9 @@ impl Erc20Subcommand {
                     .await?;
 
                 if shell::is_json() {
-                    sh_println!("{}", serde_json::to_string(&balance.to_string())?)?
+                    print_json_success(balance.to_string())?;
                 } else {
-                    sh_println!("{}", format_uint_exp(balance))?
+                    sh_println!("{balance}")?;
                 }
             }
             Self::Name { token, block, .. } => {
@@ -476,11 +537,7 @@ impl Erc20Subcommand {
                     .call()
                     .await?;
 
-                if shell::is_json() {
-                    sh_println!("{}", serde_json::to_string(&name)?)?
-                } else {
-                    sh_println!("{}", name)?
-                }
+                print_scalar(name)?;
             }
             Self::Symbol { token, block, .. } => {
                 let provider = get_provider(&config)?;
@@ -492,11 +549,7 @@ impl Erc20Subcommand {
                     .call()
                     .await?;
 
-                if shell::is_json() {
-                    sh_println!("{}", serde_json::to_string(&symbol)?)?
-                } else {
-                    sh_println!("{}", symbol)?
-                }
+                print_scalar(symbol)?;
             }
             Self::Decimals { token, block, .. } => {
                 let provider = get_provider(&config)?;
@@ -507,11 +560,7 @@ impl Erc20Subcommand {
                     .block(block.unwrap_or_default())
                     .call()
                     .await?;
-                if shell::is_json() {
-                    sh_println!("{}", serde_json::to_string(&decimals)?)?
-                } else {
-                    sh_println!("{}", decimals)?
-                }
+                print_scalar(decimals)?;
             }
             Self::TotalSupply { token, block, .. } => {
                 let provider = get_provider(&config)?;
@@ -524,7 +573,7 @@ impl Erc20Subcommand {
                     .await?;
 
                 if shell::is_json() {
-                    sh_println!("{}", serde_json::to_string(&total_supply.to_string())?)?
+                    print_json_success(total_supply.to_string())?;
                 } else {
                     sh_println!("{}", format_uint_exp(total_supply))?
                 }

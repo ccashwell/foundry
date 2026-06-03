@@ -29,6 +29,8 @@ pub mod rpc;
 pub mod run;
 pub mod send;
 pub mod storage;
+pub mod tempo;
+pub(crate) mod tempo_policy_args;
 pub mod tip20;
 pub mod trace;
 pub mod txpool;

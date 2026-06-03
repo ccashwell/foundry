@@ -18,7 +18,7 @@ use alloy_eips::{eip1559::BaseFeeParams, eip7840::BlobParams};
 use alloy_evm::EvmEnv;
 use alloy_genesis::Genesis;
 use alloy_network::{AnyNetwork, BlockResponse, TransactionResponse};
-use alloy_primitives::{BlockNumber, TxHash, U256, hex, map::HashMap, utils::Unit};
+use alloy_primitives::{Address, BlockNumber, TxHash, U256, hex, map::HashMap, utils::Unit};
 use alloy_provider::Provider;
 use alloy_rpc_types::BlockNumberOrTag;
 use alloy_signer::Signer;
@@ -37,7 +37,7 @@ use foundry_config::Config;
 use foundry_evm::{
     backend::{BlockchainDb, BlockchainDbMeta, SharedBackend},
     constants::DEFAULT_CREATE2_DEPLOYER,
-    hardfork::{FoundryHardfork, OpHardfork},
+    hardfork::FoundryHardfork,
     utils::{
         apply_chain_and_block_specific_env_changes, block_env_from_header,
         get_blob_base_fee_update_fraction,
@@ -77,6 +77,8 @@ pub const NODE_PORT: u16 = 8545;
 pub const CHAIN_ID: u64 = 31337;
 /// The default gas limit for all transactions
 pub const DEFAULT_GAS_LIMIT: u64 = 30_000_000;
+/// The default number of slots in an epoch used for safe/finalized block tags.
+pub const DEFAULT_SLOTS_IN_AN_EPOCH: u64 = 32;
 /// Default mnemonic for dev accounts
 pub const DEFAULT_MNEMONIC: &str = "test test test test test test test test test test test junk";
 
@@ -124,9 +126,9 @@ pub struct NodeConfig {
     pub genesis_block_number: Option<u64>,
     /// Signer accounts that can sign messages/transactions from the EVM node
     pub signer_accounts: Vec<PrivateKeySigner>,
-    /// Configured block time for the EVM chain. Use `None` to mine a new block for every tx
+    /// Configured block time for the EVM chain. Use `None` for instant/auto mining.
     pub block_time: Option<Duration>,
-    /// Disable auto, interval mining mode uns use `MiningMode::None` instead
+    /// Disable auto and interval mining mode and use `MiningMode::None` instead.
     pub no_mining: bool,
     /// Enables auto and interval mining mode
     pub mixed_mining: bool,
@@ -207,6 +209,8 @@ pub struct NodeConfig {
     /// The path where persisted states are cached (used with `max_persisted_states`).
     /// This does not affect the fork RPC cache location.
     pub cache_path: Option<PathBuf>,
+    /// Accounts to fund with specific balances on startup (address -> balance in wei).
+    pub funded_accounts: HashMap<Address, U256>,
 }
 
 impl NodeConfig {
@@ -507,12 +511,13 @@ impl Default for NodeConfig {
             transaction_block_keeper: None,
             disable_default_create2_deployer: false,
             disable_pool_balance_checks: false,
-            slots_in_an_epoch: 32,
+            slots_in_an_epoch: DEFAULT_SLOTS_IN_AN_EPOCH,
             memory_limit: None,
             precompile_factory: None,
             networks: Default::default(),
             silent: false,
             cache_path: None,
+            funded_accounts: HashMap::default(),
         }
     }
 }
@@ -577,8 +582,17 @@ impl NodeConfig {
         if let Some(hardfork) = self.hardfork {
             return hardfork;
         }
+        if self.networks.is_tempo()
+            && let Some(hardfork) = TempoHardfork::from_chain_and_timestamp(
+                self.get_chain_id(),
+                self.get_genesis_timestamp(),
+            )
+        {
+            return hardfork.into();
+        }
+        #[cfg(feature = "optimism")]
         if self.networks.is_optimism() {
-            return OpHardfork::default().into();
+            return foundry_evm::hardforks::OpHardfork::default().into();
         }
         if self.networks.is_tempo() {
             return TempoHardfork::default().into();
@@ -634,7 +648,7 @@ impl NodeConfig {
     pub fn set_chain_id(&mut self, chain_id: Option<impl Into<u64>>) {
         self.chain_id = chain_id.map(Into::into);
         let chain_id = self.get_chain_id();
-        self.networks.with_chain_id(chain_id);
+        self.networks = self.networks.with_chain_id(chain_id);
         self.genesis_accounts.iter_mut().for_each(|wallet| {
             *wallet = wallet.clone().with_chain_id(Some(chain_id));
         });
@@ -971,14 +985,14 @@ impl NodeConfig {
         self
     }
 
-    /// Sets whether to print `console.log` invocations to stdout.
+    /// Sets whether to print `console.log` invocations to stderr.
     #[must_use]
     pub const fn with_print_logs(mut self, print_logs: bool) -> Self {
         self.print_logs = print_logs;
         self
     }
 
-    /// Sets whether to print traces to stdout.
+    /// Sets whether to print traces to stderr.
     #[must_use]
     pub const fn with_print_traces(mut self, print_traces: bool) -> Self {
         self.print_traces = print_traces;
@@ -1026,7 +1040,7 @@ impl NodeConfig {
             foundry_common::fs::write_json_file(path, &value).wrap_err("failed writing JSON")?;
         }
         if !self.silent {
-            sh_println!("{}", self.as_string(fork))?;
+            sh_eprintln!("{}", self.as_string(fork))?;
         }
         Ok(())
     }
@@ -1079,13 +1093,14 @@ impl NodeConfig {
     }
 
     /// Enable Optimism network features.
+    #[cfg(feature = "optimism")]
     #[must_use]
     pub fn with_optimism(mut self) -> Self {
         self.networks = NetworkConfigs::with_optimism();
         self
     }
 
-    /// Makes the node silent to not emit anything on stdout
+    /// Makes the node silent to not emit any banner/status output
     #[must_use]
     pub const fn silent(self) -> Self {
         self.set_silent(true)
@@ -1104,6 +1119,13 @@ impl NodeConfig {
     #[must_use]
     pub fn with_cache_path(mut self, cache_path: Option<PathBuf>) -> Self {
         self.cache_path = cache_path;
+        self
+    }
+
+    /// Sets accounts to fund with custom balances on startup.
+    #[must_use]
+    pub fn with_funded_accounts(mut self, accounts: HashMap<Address, U256>) -> Self {
+        self.funded_accounts = accounts;
         self
     }
 
@@ -1231,6 +1253,15 @@ impl NodeConfig {
                 .set_create2_deployer(DEFAULT_CREATE2_DEPLOYER)
                 .await
                 .wrap_err("failed to create default create2 deployer")?;
+        }
+
+        if !self.funded_accounts.is_empty() {
+            for (address, balance) in &self.funded_accounts {
+                backend
+                    .set_balance(*address, *balance)
+                    .await
+                    .wrap_err_with(|| format!("failed to fund account {address}"))?;
+            }
         }
 
         Ok(backend)
@@ -1467,6 +1498,7 @@ latest block number: {latest_block}"
             provider,
             chain_id,
             override_chain_id,
+            hardfork: self.hardfork,
             timestamp: block.header.timestamp(),
             base_fee: block.header.base_fee_per_gas().map(|g| g as u128),
             timeout: self.fork_request_timeout,
@@ -1752,5 +1784,27 @@ mod tests {
         assert!(!config.is_state_history_supported());
         let config = PruneStateHistoryConfig::from_args(Some(Some(10)));
         assert!(config.is_state_history_supported());
+    }
+
+    #[cfg(feature = "optimism")]
+    #[test]
+    fn set_chain_id_updates_network_config() {
+        let mut config = NodeConfig::test();
+        config.set_chain_id(Some(10u64));
+
+        assert!(config.networks.is_optimism());
+    }
+
+    #[test]
+    fn get_hardfork_on_tempo_never_returns_non_tempo_variant() {
+        // Post-Shanghai timestamp on Ethereum mainnet.
+        let shanghai_ts = 1_681_338_455u64;
+
+        let config = NodeConfig::test_tempo()
+            .with_chain_id(Some(1u64))
+            .with_genesis_timestamp(Some(shanghai_ts));
+
+        assert!(config.networks.is_tempo());
+        assert!(matches!(config.get_hardfork(), FoundryHardfork::Tempo(_)));
     }
 }

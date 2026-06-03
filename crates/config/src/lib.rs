@@ -53,7 +53,9 @@ use std::{
 mod macros;
 
 pub mod utils;
-pub use foundry_evm_hardforks::{FoundryHardfork, FromEvmVersion, evm_spec_id};
+pub use foundry_evm_hardforks::{
+    ExecutionSpec, FoundryHardfork, FromEvmVersion, evm_spec_id, evm_spec_id_from_str,
+};
 pub use utils::*;
 
 mod endpoints;
@@ -110,6 +112,12 @@ pub use fuzz::{FuzzConfig, FuzzCorpusConfig, FuzzDictionaryConfig};
 
 mod invariant;
 pub use invariant::InvariantConfig;
+
+mod coverage;
+pub use coverage::{CoverageConfig, CoverageReportKind, parse_lcov_version};
+
+pub mod mutation;
+pub use mutation::{MutationConfig, MutatorType};
 
 mod inline;
 pub use inline::{InlineConfig, InlineConfigError, NatSpec};
@@ -349,6 +357,8 @@ pub struct Config {
     pub coverage_pattern_inverse: Option<RegexWrapper>,
     /// Path where last test run failures are recorded.
     pub test_failures_file: PathBuf,
+    /// Path where mutation tests are cached, to resume running them
+    pub mutation_dir: PathBuf,
     /// Max concurrent threads to use.
     pub threads: Option<usize>,
     /// Whether to show test execution progress.
@@ -357,6 +367,10 @@ pub struct Config {
     pub fuzz: FuzzConfig,
     /// Configuration for invariant testing
     pub invariant: InvariantConfig,
+    /// Configuration for `forge coverage`
+    pub coverage: CoverageConfig,
+    /// Configuration for mutation testing
+    pub mutation: MutationConfig,
     /// Whether to allow ffi cheatcodes in test
     pub ffi: bool,
     /// Whether to show `console.log` outputs in realtime during script/test execution
@@ -708,6 +722,8 @@ impl Config {
         "doc",
         "fuzz",
         "invariant",
+        "coverage",
+        "mutation",
         "labels",
         "dependencies",
         "soldeer",
@@ -1327,6 +1343,9 @@ impl Config {
             ));
         }
 
+        // Remove mutation test cache directory
+        let _ = fs::remove_dir_all(project.root().join(&self.mutation_dir));
+
         // Remove fuzz and invariant cache directories.
         let mut remove_test_dir = |test_dir: &Option<PathBuf>| {
             if let Some(test_dir) = test_dir {
@@ -1845,9 +1864,14 @@ impl Config {
     /// Returns the configured [VyperSettings] that includes:
     /// - evm version
     pub fn vyper_settings(&self) -> Result<VyperSettings, SolcError> {
+        // Let `opt_level` override `optimize` so child profiles can switch away from an
+        // inherited optimization mode without sending both mutually exclusive settings to Vyper.
+        let optimize = if self.vyper.opt_level.is_some() { None } else { self.vyper.optimize };
+
         Ok(VyperSettings {
             evm_version: Some(self.evm_version),
-            optimize: self.vyper.optimize,
+            optimize,
+            opt_level: self.vyper.opt_level,
             bytecode_metadata: None,
             // TODO: We don't yet have a way to deserialize other outputs correctly, so request only
             // those for now. It should be enough to run tests and deploy contracts.
@@ -1858,6 +1882,10 @@ impl Config {
             ]),
             search_paths: None,
             experimental_codegen: self.vyper.experimental_codegen,
+            debug: self.vyper.debug,
+            enable_decimals: self.vyper.enable_decimals,
+            venom_experimental: self.vyper.venom_experimental,
+            venom: self.vyper.venom.clone(),
         })
     }
 
@@ -2673,10 +2701,13 @@ impl Default for Config {
             path_pattern_inverse: None,
             coverage_pattern_inverse: None,
             test_failures_file: "cache/test-failures".into(),
+            mutation_dir: "cache/mutation".into(),
             threads: None,
             show_progress: false,
             fuzz: FuzzConfig::new("cache/fuzz".into()),
             invariant: InvariantConfig::new("cache/invariant".into()),
+            coverage: CoverageConfig::default(),
+            mutation: MutationConfig::default(),
             always_use_create_2_factory: false,
             ffi: false,
             live_logs: false,
@@ -2941,9 +2972,10 @@ mod tests {
     use endpoints::{RpcAuth, RpcEndpointConfig};
     use figment::error::Kind::InvalidType;
     use foundry_compilers::artifacts::{
-        ModelCheckerEngine, YulDetails, vyper::VyperOptimizationMode,
+        ModelCheckerEngine, YulDetails,
+        vyper::{VyperOptimizationLevel, VyperOptimizationMode, VyperVenomSettings},
     };
-    use foundry_evm_hardforks::TempoHardfork;
+    use foundry_evm_hardforks::{TempoHardfork, latest_active_tempo_hardfork};
     use similar_asserts::assert_eq;
     use soldeer_core::remappings::RemappingsLocation;
     use std::{fs::File, io::Write};
@@ -4161,6 +4193,7 @@ mod tests {
                 [invariant]
                 runs = 256
                 depth = 500
+                workers = 1
                 fail_on_revert = false
                 call_override = false
                 shrink_run_limit = 5000
@@ -4973,6 +5006,7 @@ mod tests {
                 [invariant]
                 runs = 512
                 depth = 10
+                workers = 4
             ",
             )?;
 
@@ -4982,6 +5016,7 @@ mod tests {
                 InvariantConfig {
                     runs: 512,
                     depth: 10,
+                    workers: 4,
                     failure_persist_dir: Some(PathBuf::from("cache/invariant")),
                     ..Default::default()
                 }
@@ -5008,11 +5043,13 @@ mod tests {
             jail.set_env("FOUNDRY_FMT_LINE_LENGTH", "95");
             jail.set_env("FOUNDRY_FUZZ_DICTIONARY_WEIGHT", "99");
             jail.set_env("FOUNDRY_INVARIANT_DEPTH", "5");
+            jail.set_env("FOUNDRY_INVARIANT_WORKERS", "3");
 
             let config = Config::load().unwrap();
             assert_eq!(config.fmt.line_length, 95);
             assert_eq!(config.fuzz.dictionary.dictionary_weight, 99);
             assert_eq!(config.invariant.depth, 5);
+            assert_eq!(config.invariant.workers, 3);
 
             Ok(())
         });
@@ -5078,6 +5115,25 @@ mod tests {
         };
 
         assert_eq!(config.evm_spec_id::<TempoHardfork>(), TempoHardfork::T3);
+    }
+
+    #[test]
+    fn tempo_network_defaults_to_latest_tempo_hardfork() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [profile.default]
+                network = "tempo"
+            "#,
+            )?;
+
+            let config = Config::load().unwrap();
+            assert!(config.networks.is_tempo());
+            assert_eq!(config.evm_spec_id::<TempoHardfork>(), latest_active_tempo_hardfork());
+
+            Ok(())
+        });
     }
 
     #[test]
@@ -5421,9 +5477,26 @@ mod tests {
                 "foundry.toml",
                 r#"
                 [vyper]
-                optimize = "codesize"
+                optimize = "O1"
                 path = "/path/to/vyper"
                 experimental_codegen = true
+                venom_experimental = false
+                debug = true
+                enable_decimals = true
+
+                [vyper.venom]
+                disable_inlining = true
+                disable_cse = true
+                disable_sccp = false
+                disable_load_elimination = true
+                disable_dead_store_elimination = false
+                disable_algebraic_optimization = true
+                disable_branch_optimization = false
+                disable_assert_elimination = true
+                disable_mem2var = false
+                disable_simplify_cfg = true
+                disable_remove_unused_variables = false
+                inline_threshold = 15
             "#,
             )?;
 
@@ -5431,14 +5504,84 @@ mod tests {
             assert_eq!(
                 config.vyper,
                 VyperConfig {
-                    optimize: Some(VyperOptimizationMode::Codesize),
+                    optimize: Some(VyperOptimizationMode::O1),
+                    opt_level: None,
                     path: Some("/path/to/vyper".into()),
                     experimental_codegen: Some(true),
+                    venom_experimental: Some(false),
+                    debug: Some(true),
+                    enable_decimals: Some(true),
+                    venom: Some(VyperVenomSettings {
+                        disable_inlining: Some(true),
+                        disable_cse: Some(true),
+                        disable_sccp: Some(false),
+                        disable_load_elimination: Some(true),
+                        disable_dead_store_elimination: Some(false),
+                        disable_algebraic_optimization: Some(true),
+                        disable_branch_optimization: Some(false),
+                        disable_assert_elimination: Some(true),
+                        disable_mem2var: Some(false),
+                        disable_simplify_cfg: Some(true),
+                        disable_remove_unused_variables: Some(false),
+                        inline_threshold: Some(15),
+                    }),
                 }
             );
 
             Ok(())
         });
+    }
+
+    #[test]
+    fn test_vyper_settings_include_extended_config() {
+        let config = Config {
+            vyper: VyperConfig {
+                opt_level: Some(VyperOptimizationLevel::O3),
+                experimental_codegen: Some(true),
+                venom_experimental: Some(false),
+                debug: Some(true),
+                enable_decimals: Some(true),
+                venom: Some(VyperVenomSettings {
+                    disable_cse: Some(true),
+                    inline_threshold: Some(15),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Config::default().normalized_optimizer_settings()
+        };
+
+        let settings = config.vyper_settings().unwrap();
+        assert_eq!(settings.optimize, None);
+        assert_eq!(settings.opt_level, Some(VyperOptimizationLevel::O3));
+        assert_eq!(settings.experimental_codegen, Some(true));
+        assert_eq!(settings.venom_experimental, Some(false));
+        assert_eq!(settings.debug, Some(true));
+        assert_eq!(settings.enable_decimals, Some(true));
+        assert_eq!(
+            settings.venom,
+            Some(VyperVenomSettings {
+                disable_cse: Some(true),
+                inline_threshold: Some(15),
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn vyper_opt_level_overrides_optimize() {
+        let config = Config {
+            vyper: VyperConfig {
+                optimize: Some(VyperOptimizationMode::Gas),
+                opt_level: Some(VyperOptimizationLevel::O3),
+                ..Default::default()
+            },
+            ..Config::default().normalized_optimizer_settings()
+        };
+
+        let settings = config.vyper_settings().unwrap();
+        assert_eq!(settings.optimize, None);
+        assert_eq!(settings.opt_level, Some(VyperOptimizationLevel::O3));
     }
 
     #[test]
@@ -6830,6 +6973,9 @@ mod tests {
                 runs = 256
                 unknown_invariant_key = "should_warn"
 
+                [mutation]
+                unknown_mutation_key = "should_warn"
+
                 [vyper]
                 unknown_vyper_key = "should_warn"
 
@@ -6857,6 +7003,9 @@ mod tests {
                 [profile.default.invariant]
                 runs = 512
                 unknown_nested_invariant_key = "should_warn"
+
+                [profile.default.mutation]
+                unknown_nested_mutation_key = "should_warn"
 
                 [profile.default.vyper]
                 unknown_nested_vyper_key = "should_warn"
@@ -6896,6 +7045,7 @@ mod tests {
                 ("unknown_doc_key", "doc"),
                 ("unknown_fuzz_key", "fuzz"),
                 ("unknown_invariant_key", "invariant"),
+                ("unknown_mutation_key", "mutation"),
                 ("unknown_vyper_key", "vyper"),
                 ("unknown_bind_json_key", "bind_json"),
             ];
@@ -6921,6 +7071,7 @@ mod tests {
                 ("unknown_nested_doc_key", "doc"),
                 ("unknown_nested_fuzz_key", "fuzz"),
                 ("unknown_nested_invariant_key", "invariant"),
+                ("unknown_nested_mutation_key", "mutation"),
                 ("unknown_nested_vyper_key", "vyper"),
                 ("unknown_nested_bind_json_key", "bind_json"),
             ];
@@ -6969,11 +7120,11 @@ mod tests {
                 })
                 .collect();
 
-            // 1 profile key + 7 standalone + 7 nested + 2 array = 17 total
+            // 1 profile key + 8 standalone + 8 nested + 2 array = 19 total
             assert_eq!(
                 unknown_key_warnings.len(),
-                17,
-                "Expected 17 unknown key warnings (1 profile + 7 standalone + 7 nested + 2 array), got {}: {:?}",
+                19,
+                "Expected 19 unknown key warnings (1 profile + 8 standalone + 8 nested + 2 array), got {}: {:?}",
                 unknown_key_warnings.len(),
                 unknown_key_warnings
             );
@@ -7131,9 +7282,16 @@ mod tests {
                 src = "src"
 
                 [vyper]
-                optimize = "gas"
+                optimize = "O1"
                 path = "/usr/bin/vyper"
                 experimental_codegen = true
+                venom_experimental = false
+                debug = true
+                enable_decimals = true
+
+                [vyper.venom]
+                disable_cse = true
+                inline_threshold = 15
                 "#,
             )?;
 
@@ -7170,9 +7328,12 @@ mod tests {
                 src = "src"
 
                 [profile.default.vyper]
-                optimize = "codesize"
+                opt_level = "s"
                 path = "/opt/vyper/bin/vyper"
                 experimental_codegen = false
+                debug = true
+                enable_decimals = true
+                venom = { disable_sccp = true, disable_mem2var = false }
                 "#,
             )?;
 
@@ -7208,13 +7369,13 @@ mod tests {
                 r#"
                 [profile.default]
                 src = "src"
-                vyper = { optimize = "gas" }
+                vyper = { optimize = "gas", debug = true }
 
                 [profile.default-venom]
-                vyper = { experimental_codegen = true }
+                vyper = { opt_level = "O2", experimental_codegen = true, venom = { disable_cse = true } }
 
                 [profile.ci-venom]
-                vyper = { experimental_codegen = true }
+                vyper = { venom_experimental = true, enable_decimals = true }
                 "#,
             )?;
 
@@ -7438,6 +7599,98 @@ mod tests {
             assert_eq!(config.invariant.runs, 375);
             assert_eq!(config.invariant.depth, 500);
 
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn coverage_section_in_profile() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [profile.default.coverage]
+                report = ["summary", "lcov"]
+                lcov_version = "2.2.0"
+                ir_minimum = true
+                report_file = "out/lcov.info"
+                include_libs = true
+                exclude_tests = true
+                skip_files = ["test/**", "src/mocks/**"]
+                "#,
+            )?;
+            let config = Config::load_with_root(jail.directory()).unwrap();
+            assert_eq!(
+                config.coverage.report,
+                vec![CoverageReportKind::Summary, CoverageReportKind::Lcov]
+            );
+            assert_eq!(config.coverage.lcov_version, semver::Version::new(2, 2, 0));
+            assert!(config.coverage.ir_minimum);
+            assert_eq!(
+                config.coverage.report_file.as_deref(),
+                Some(std::path::Path::new("out/lcov.info"))
+            );
+            assert!(config.coverage.include_libs);
+            assert!(config.coverage.exclude_tests);
+            assert_eq!(
+                config.coverage.skip_files,
+                vec!["test/**".to_string(), "src/mocks/**".to_string()]
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn coverage_standalone_section_falls_back_to_default_profile() {
+        figment::Jail::expect_with(|jail| {
+            // Standalone `[coverage]` should populate the active profile,
+            // matching how `[fuzz]` / `[invariant]` work.
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [coverage]
+                skip_files = ["script/**"]
+                exclude_tests = true
+                "#,
+            )?;
+            let config = Config::load_with_root(jail.directory()).unwrap();
+            assert_eq!(config.coverage.skip_files, vec!["script/**".to_string()]);
+            assert!(config.coverage.exclude_tests);
+            // Untouched fields keep their defaults.
+            assert_eq!(config.coverage.report, vec![CoverageReportKind::Summary]);
+            assert_eq!(config.coverage.lcov_version, semver::Version::new(1, 0, 0));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn coverage_per_profile_overrides_default() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [profile.default.coverage]
+                skip_files = ["script/**"]
+
+                [profile.ci.coverage]
+                skip_files = ["test/**", "lib/**"]
+                exclude_tests = true
+                "#,
+            )?;
+
+            // Default profile sees the default-profile coverage block.
+            let config = Config::load_with_root(jail.directory()).unwrap();
+            assert_eq!(config.coverage.skip_files, vec!["script/**".to_string()]);
+            assert!(!config.coverage.exclude_tests);
+
+            // CI profile sees its own override.
+            jail.set_env("FOUNDRY_PROFILE", "ci");
+            let config = Config::load_with_root(jail.directory()).unwrap();
+            assert_eq!(
+                config.coverage.skip_files,
+                vec!["test/**".to_string(), "lib/**".to_string()]
+            );
+            assert!(config.coverage.exclude_tests);
             Ok(())
         });
     }

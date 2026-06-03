@@ -7,6 +7,7 @@
 use crate::{
     call_spec::CallSpec,
     cmd::send::{cast_send, cast_send_with_access_key},
+    tempo,
     tx::{self, CastTxBuilder, SendTxOpts},
 };
 use alloy_network::{EthereumWallet, TransactionBuilder};
@@ -51,6 +52,7 @@ pub struct BatchSendArgs {
 impl BatchSendArgs {
     pub async fn run(self) -> Result<()> {
         let Self { calls, send_tx, mut tx, unlocked } = self;
+        let expires_at = tx.tempo.resolve_expires();
 
         if calls.is_empty() {
             return Err(eyre!("No calls specified. Use --call to specify at least one call."));
@@ -95,15 +97,16 @@ impl BatchSendArgs {
             );
         }
 
-        sh_println!("Building batch transaction with {} call(s)...", tempo_calls.len())?;
+        sh_status!("Building batch transaction with {} call(s)...", tempo_calls.len())?;
+        tempo::print_expires(expires_at)?;
+
+        // Preserve key_id for modes that do not call build_with_access_key, such as unlocked.
+        if let Some(ref access_key) = tempo_access_key {
+            tx.tempo.key_id = Some(access_key.key_address);
+        }
 
         // Build transaction request with calls
         let mut builder = CastTxBuilder::<TempoNetwork, _, _>::new(&provider, tx, &config).await?;
-
-        // Set key_id for access key transactions
-        if let Some(ref access_key) = tempo_access_key {
-            builder.tx.set_key_id(access_key.key_address);
-        }
 
         // Access the inner tx and set calls
         builder.tx.calls = tempo_calls;
@@ -130,6 +133,7 @@ impl BatchSendArgs {
                 timeout,
             )
             .await
+            .map(drop)
         } else {
             let signer = match signer {
                 Some(s) => s,
@@ -137,7 +141,8 @@ impl BatchSendArgs {
             };
 
             if let Some(ref access_key) = tempo_access_key {
-                let (tx_request, _) = builder.build(access_key.wallet_address).await?;
+                let (tx_request, _) =
+                    builder.build_with_access_key(access_key.wallet_address, access_key).await?;
                 maybe_print_resolved_lane(
                     resolved_lane.as_ref(),
                     tx_request.nonce().unwrap_or_default(),
